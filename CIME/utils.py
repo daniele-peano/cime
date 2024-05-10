@@ -8,8 +8,10 @@ import io, logging, gzip, sys, os, time, re, shutil, glob, string, random, impor
 import importlib.util
 import errno, signal, warnings, filecmp
 import stat as statlib
+from argparse import Action
 from contextlib import contextmanager
 
+# pylint: disable=deprecated-module
 from distutils import file_util
 
 # Return this error code if the scripts worked but tests failed
@@ -19,6 +21,14 @@ logger = logging.getLogger(__name__)
 # Fix to pass user defined `srcroot` to `CIME.XML.generic_xml.GenericXML`
 # where it's used to resolve $SRCROOT in XML config files.
 GLOBAL = {}
+
+
+def deprecate_action(message):
+    class ActionStoreDeprecated(Action):
+        def __call__(self, parser, namespace, values, option_string=None):
+            raise DeprecationWarning(f"{option_string} is deprecated{message}")
+
+    return ActionStoreDeprecated
 
 
 def import_from_file(name, file_path):
@@ -192,7 +202,7 @@ def check_name(fullname, additional_chars=None, fullpath=False):
     False
     """
 
-    chars = "+*?<>/{}[\]~`@:"  # pylint: disable=anomalous-backslash-in-string
+    chars = r"+*?<>/{}[\]~`@:"
     if additional_chars is not None:
         chars += additional_chars
     if fullname.endswith("/"):
@@ -262,7 +272,7 @@ def _read_cime_config_file():
     cime_config_file = os.path.abspath(
         os.path.join(os.path.expanduser("~"), ".cime", "config")
     )
-    cime_config = configparser.SafeConfigParser()
+    cime_config = configparser.ConfigParser()
     if os.path.isfile(cime_config_file):
         cime_config.read(cime_config_file)
         for section in cime_config.sections():
@@ -633,7 +643,7 @@ def import_and_run_sub_or_cmd(
     try:
         mod = importlib.import_module(f"{compname}_cime_py")
         getattr(mod, subname)(*subargs)
-    except (ModuleNotFoundError, AttributeError) as _:
+    except (ModuleNotFoundError, AttributeError) as e:
         # * ModuleNotFoundError if importlib can not find module,
         # * AttributeError if importlib finds the module but
         #   {subname} is not defined in the module
@@ -641,7 +651,19 @@ def import_and_run_sub_or_cmd(
             os.path.isfile(cmd),
             f"Could not find {subname} file for component {compname}",
         )
-        run_sub_or_cmd(cmd, cmdargs, subname, subargs, logfile, case, from_dir, timeout)
+
+        # TODO shouldn't need to use logger.isEnabledFor for debug logging
+        if isinstance(e, ModuleNotFoundError) and logger.isEnabledFor(logging.DEBUG):
+            logger.info(
+                "WARNING: Could not import module '{}_cime_py'".format(compname)
+            )
+
+        try:
+            run_sub_or_cmd(
+                cmd, cmdargs, subname, subargs, logfile, case, from_dir, timeout
+            )
+        except Exception as e1:
+            raise e1 from None
     except Exception:
         if logfile:
             with open(logfile, "a") as log_fd:
@@ -993,6 +1015,12 @@ def parse_test_name(test_name):
     ['ERS', None, 'fe12_123', 'JGF', 'machine', 'compiler', None]
     >>> parse_test_name('ERS.fe12_123.JGF.machine_compiler.test-mods')
     ['ERS', None, 'fe12_123', 'JGF', 'machine', 'compiler', ['test/mods']]
+    >>> parse_test_name('ERS.fe12_123.JGF.*_compiler.test-mods')
+    ['ERS', None, 'fe12_123', 'JGF', None, 'compiler', ['test/mods']]
+    >>> parse_test_name('ERS.fe12_123.JGF.machine_*.test-mods')
+    ['ERS', None, 'fe12_123', 'JGF', 'machine', None, ['test/mods']]
+    >>> parse_test_name('ERS.fe12_123.JGF.*_*.test-mods')
+    ['ERS', None, 'fe12_123', 'JGF', None, None, ['test/mods']]
     >>> parse_test_name('ERS.fe12_123.JGF.machine_compiler.test-mods--other-dir-path--and-one-more')
     ['ERS', None, 'fe12_123', 'JGF', 'machine', 'compiler', ['test/mods', 'other/dir/path', 'and/one/more']]
     >>> parse_test_name('SMS.f19_g16.2000_DATM%QI.A_XLND_SICE_SOCN_XROF_XGLC_SWAV.mach-ine_compiler.test-mods') # doctest: +IGNORE_EXCEPTION_DETAIL
@@ -1026,6 +1054,10 @@ def parse_test_name(test_name):
             ),
         )
         rv[4:5] = rv[4].split("_")
+        if rv[4] == "*":
+            rv[4] = None
+        if rv[5] == "*":
+            rv[5] = None
         rv.pop()
 
     if rv[-1] is not None:
@@ -1118,7 +1150,6 @@ def get_full_test_name(
     ]
 
     result = partial_test
-
     for partial_val, arg_val, name in required_fields:
         if partial_val is None:
             # Add to result based on args
@@ -1128,9 +1159,14 @@ def get_full_test_name(
                     partial_test, name
                 ),
             )
-            result = "{}{}{}".format(
-                result, "_" if name == "compiler" else ".", arg_val
-            )
+            if name == "machine" and "*_" in result:
+                result = result.replace("*_", arg_val + "_")
+            elif name == "compiler" and "_*" in result:
+                result = result.replace("_*", "_" + arg_val)
+            else:
+                result = "{}{}{}".format(
+                    result, "_" if name == "compiler" else ".", arg_val
+                )
         elif arg_val is not None and partial_val != partial_compiler:
             expect(
                 arg_val == partial_val,
@@ -1276,13 +1312,15 @@ def start_buffering_output():
     sys.stdout = os.fdopen(sys.stdout.fileno(), "w")
 
 
-def match_any(item, re_list):
+def match_any(item, re_counts):
     """
-    Return true if item matches any regex in re_list
+    Return true if item matches any regex in re_counts' keys. Increments
+    count if a match was found.
     """
-    for regex_str in re_list:
+    for regex_str in re_counts:
         regex = re.compile(regex_str)
         if regex.match(item):
+            re_counts[regex_str] += 1
             return True
 
     return False
@@ -1376,6 +1414,7 @@ def safe_copy(src_path, tgt_path, preserve_meta=True):
                 tgt_path,
                 preserve_mode=preserve_meta,
                 preserve_times=preserve_meta,
+                verbose=0,
             )
         else:
             # I am not the owner, just copy file contents
@@ -1389,6 +1428,7 @@ def safe_copy(src_path, tgt_path, preserve_meta=True):
             tgt_path,
             preserve_mode=preserve_meta,
             preserve_times=preserve_meta,
+            verbose=0,
         )
 
     # If src file was executable, then the tgt file should be too
@@ -1588,20 +1628,25 @@ def find_files(rootdir, pattern):
 
 
 def setup_standard_logging_options(parser):
+    group = parser.add_argument_group("Logging options")
+
     helpfile = os.path.join(os.getcwd(), os.path.basename("{}.log".format(sys.argv[0])))
-    parser.add_argument(
+
+    group.add_argument(
         "-d",
         "--debug",
         action="store_true",
         help="Print debug information (very verbose) to file {}".format(helpfile),
     )
-    parser.add_argument(
+
+    group.add_argument(
         "-v",
         "--verbose",
         action="store_true",
         help="Add additional context (time and file) to log messages",
     )
-    parser.add_argument(
+
+    group.add_argument(
         "-s",
         "--silent",
         action="store_true",
@@ -2667,3 +2712,46 @@ def clear_folder(_dir):
                     os.rmdir(file_path)
             except Exception as e:
                 print(e)
+
+
+def add_flag_to_cmd(flag, val):
+    """
+    Given a flag and value for a shell command, return a string
+
+    >>> add_flag_to_cmd("-f", "hi")
+    '-f hi'
+    >>> add_flag_to_cmd("--foo", 42)
+    '--foo 42'
+    >>> add_flag_to_cmd("--foo=", 42)
+    '--foo=42'
+    >>> add_flag_to_cmd("--foo:", 42)
+    '--foo:42'
+    >>> add_flag_to_cmd("--foo:", " hi ")
+    '--foo:hi'
+    """
+    no_space_chars = "=:"
+    no_space = False
+    for item in no_space_chars:
+        if flag.endswith(item):
+            no_space = True
+
+    separator = "" if no_space else " "
+    return "{}{}{}".format(flag, separator, str(val).strip())
+
+
+def is_comp_standalone(case):
+    """
+    Test if the case is a single component standalone
+    such as FKESSLER
+    """
+    stubcnt = 0
+    classes = case.get_values("COMP_CLASSES")
+    for comp in classes:
+        if case.get_value("COMP_{}".format(comp)) == "s{}".format(comp.lower()):
+            stubcnt = stubcnt + 1
+        else:
+            model = comp.lower()
+    numclasses = len(classes)
+    if stubcnt >= numclasses - 2:
+        return True, model
+    return False, get_model()

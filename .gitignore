@@ -26,3 +26,5 @@ scripts/Tools/JENKINS*
 components
 libraries
 share
+test_coverage/**
+*.bak

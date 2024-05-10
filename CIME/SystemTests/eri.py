@@ -29,8 +29,11 @@ def _helper(dout_sr, refdate, refsec, rundir):
 
     for item in glob.glob("{}/*{}*".format(rest_path, refdate)):
         dst = os.path.join(rundir, os.path.basename(item))
-        if os.path.exists(dst):
+        if not os.path.exists(rundir):
+            os.mkdir(rundir)
+        elif os.path.exists(dst):
             os.remove(dst)
+
         os.symlink(item, dst)
 
     for item in glob.glob("{}/*rpointer*".format(rest_path)):
@@ -38,11 +41,11 @@ def _helper(dout_sr, refdate, refsec, rundir):
 
 
 class ERI(SystemTestsCommon):
-    def __init__(self, case):
+    def __init__(self, case, **kwargs):
         """
         initialize an object interface to the ERI system test
         """
-        SystemTestsCommon.__init__(self, case)
+        SystemTestsCommon.__init__(self, case, **kwargs)
         self._testname = "ERI"
 
     def run_phase(self):

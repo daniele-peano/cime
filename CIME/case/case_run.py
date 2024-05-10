@@ -5,10 +5,12 @@ from CIME.XML.standard_module_setup import *
 from CIME.config import Config
 from CIME.utils import gzip_existing_file, new_lid, run_and_log_case_status
 from CIME.utils import run_sub_or_cmd, append_status, safe_copy, model_log, CIMEError
-from CIME.utils import get_model, batch_jobid
+from CIME.utils import batch_jobid, is_comp_standalone
 from CIME.get_timing import get_timing
 
 import shutil, time, sys, os, glob
+
+TERMINATION_TEXT = ("HAS ENDED", "END OF MODEL RUN", "SUCCESSFUL TERMINATION")
 
 logger = logging.getLogger(__name__)
 
@@ -292,40 +294,39 @@ def _post_run_check(case, lid):
     ###############################################################################
 
     rundir = case.get_value("RUNDIR")
-    model = case.get_value("MODEL")
     driver = case.get_value("COMP_INTERFACE")
-    model = get_model()
 
-    fv3_standalone = False
+    comp_standalone, model = is_comp_standalone(case)
 
-    if "CPL" not in case.get_values("COMP_CLASSES"):
-        fv3_standalone = True
     if driver == "nuopc":
-        if fv3_standalone:
+        if comp_standalone:
             file_prefix = model
         else:
-            file_prefix = "drv"
+            file_prefix = "med"
     else:
         file_prefix = "cpl"
 
     cpl_ninst = 1
-    if file_prefix != "drv" and case.get_value("MULTI_DRIVER"):
+    if case.get_value("MULTI_DRIVER"):
         cpl_ninst = case.get_value("NINST_MAX")
     cpl_logs = []
 
-    if file_prefix != "drv" and cpl_ninst > 1:
+    if cpl_ninst > 1:
         for inst in range(cpl_ninst):
             cpl_logs.append(
                 os.path.join(rundir, file_prefix + "_%04d.log." % (inst + 1) + lid)
             )
+            if driver == "nuopc" and comp_standalone:
+                cpl_logs.append(
+                    os.path.join(rundir, "med_%04d.log." % (inst + 1) + lid)
+                )
     else:
         cpl_logs = [os.path.join(rundir, file_prefix + ".log." + lid)]
-
+        if driver == "nuopc" and comp_standalone:
+            cpl_logs.append(os.path.join(rundir, "med.log." + lid))
     cpl_logfile = cpl_logs[0]
-
     # find the last model.log and cpl.log
     model_logfile = os.path.join(rundir, model + ".log." + lid)
-
     if not os.path.isfile(model_logfile):
         expect(False, "Model did not complete, no {} log file ".format(model_logfile))
     elif os.stat(model_logfile).st_size == 0:
@@ -336,11 +337,10 @@ def _post_run_check(case, lid):
             if not os.path.isfile(cpl_logfile):
                 break
             with open(cpl_logfile, "r") as fd:
-                if fv3_standalone and "HAS ENDED" in fd.read():
+                logfile = fd.read()
+                if any([x in logfile for x in TERMINATION_TEXT]):
                     count_ok += 1
-                elif not fv3_standalone and "SUCCESSFUL TERMINATION" in fd.read():
-                    count_ok += 1
-        if count_ok != cpl_ninst:
+        if count_ok < cpl_ninst:
             expect(False, "Model did not complete - see {} \n ".format(cpl_logfile))
 
 
