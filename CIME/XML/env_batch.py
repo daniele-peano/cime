@@ -1128,6 +1128,9 @@ class EnvBatch(EnvBase):
             return output
 
         search_match = re.search(jobid_pattern, output)
+        if search_match is None:
+            jobid_pattern = "(\d+)"
+            search_match = re.search(jobid_pattern, output)
         expect(
             search_match is not None,
             "Couldn't match jobid_pattern '{}' within submit output:\n '{}'".format(
